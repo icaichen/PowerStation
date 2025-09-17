@@ -2,6 +2,7 @@ import SwiftUI
 import Cocoa
 import Carbon
 import Combine
+import ApplicationServices
 
 // MARK: - Main App
 @main
@@ -58,15 +59,260 @@ struct PowerStationApp: App {
     }
 }
 
+// MARK: - Workstation HUD
+class WorkstationHUD: ObservableObject {
+    static let shared = WorkstationHUD()
+
+    @Published var isVisible = false
+    @Published var selectedIndex = 0
+    @Published var workstations: [Workstation] = []
+    @Published var message: String = ""
+    @Published var isLoading = false
+
+    private var hudWindow: NSWindow?
+    private var keyMonitor: Any?
+
+    private init() {}
+
+    func toggle() {
+        if isVisible {
+            hide()
+        } else {
+            show()
+        }
+    }
+
+    func show() {
+        workstations = WindowManager.shared.workstations
+        guard !workstations.isEmpty else {
+            showMessage("No saved workstations")
+            return
+        }
+
+        selectedIndex = 0
+        isVisible = true
+        isLoading = false
+        createHUDWindow()
+        setupKeyMonitoring()
+    }
+
+    func showLoading(_ message: String) {
+        self.message = message
+        isLoading = true
+        isVisible = true
+        createHUDWindow()
+    }
+
+    func showMessage(_ message: String) {
+        self.message = message
+        isLoading = false
+        isVisible = true
+        createHUDWindow()
+
+        // Auto-hide after 2 seconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            self.hide()
+        }
+    }
+
+    func hide() {
+        isVisible = false
+        hudWindow?.close()
+        hudWindow = nil
+        removeKeyMonitoring()
+    }
+
+    func selectNext() {
+        guard !workstations.isEmpty else { return }
+        selectedIndex = (selectedIndex + 1) % workstations.count
+    }
+
+    func selectPrevious() {
+        guard !workstations.isEmpty else { return }
+        selectedIndex = selectedIndex > 0 ? selectedIndex - 1 : workstations.count - 1
+    }
+
+    func activateSelected() {
+        guard selectedIndex < workstations.count else { return }
+        let selectedWorkstation = workstations[selectedIndex]
+        hide()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            WindowManager.shared.loadWorkstation(selectedWorkstation)
+        }
+    }
+
+    private func createHUDWindow() {
+        hudWindow?.close()
+
+        let contentView = WorkstationHUDView()
+            .environmentObject(self)
+
+        let hostingView = NSHostingView(rootView: contentView)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+
+        window.contentView = hostingView
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.level = .screenSaver
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+
+        hudWindow = window
+    }
+
+    private func setupKeyMonitoring() {
+        removeKeyMonitoring()
+
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            guard let self = self, self.isVisible && !self.isLoading else { return event }
+
+            switch event.keyCode {
+            case 126: // Up arrow
+                self.selectPrevious()
+                return nil
+            case 125: // Down arrow
+                self.selectNext()
+                return nil
+            case 36: // Return
+                self.activateSelected()
+                return nil
+            case 53: // Escape
+                self.hide()
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func removeKeyMonitoring() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
+    }
+}
+
+// MARK: - Global Hotkey Handler
+class GlobalHotkeyManager {
+    static let shared = GlobalHotkeyManager()
+
+    private var hotkeys: [EventHotKeyRef?] = []
+    private var eventHandler: EventHandlerRef?
+
+    enum HotkeyID: UInt32 {
+        case savePermanent = 1
+        case saveTemporary = 2
+        case snapLeft = 3
+        case snapRight = 4
+        case snapUp = 5
+        case snapDown = 6
+        case workstationHUD = 7
+    }
+
+    private init() {
+        setupEventHandler()
+    }
+
+    private func setupEventHandler() {
+        let eventSpec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
+        var eventSpecArray = [eventSpec]
+
+        InstallEventHandler(GetApplicationEventTarget(), { (handler, event, userData) -> OSStatus in
+            var hotkeyID = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotkeyID)
+
+            DispatchQueue.main.async {
+                GlobalHotkeyManager.shared.handleHotkey(id: HotkeyID(rawValue: hotkeyID.id))
+            }
+
+            return noErr
+        }, 1, &eventSpecArray, nil, &eventHandler)
+    }
+
+    func registerHotkeys() {
+        // Clear existing hotkeys
+        hotkeys.forEach { hotkey in
+            if let hotkey = hotkey {
+                UnregisterEventHotKey(hotkey)
+            }
+        }
+        hotkeys.removeAll()
+
+        // Register new hotkeys
+        registerHotkey(.savePermanent, keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(cmdKey | optionKey))
+        registerHotkey(.saveTemporary, keyCode: UInt32(kVK_ANSI_T), modifiers: UInt32(cmdKey | optionKey))
+        registerHotkey(.snapLeft, keyCode: UInt32(kVK_LeftArrow), modifiers: UInt32(optionKey))
+        registerHotkey(.snapRight, keyCode: UInt32(kVK_RightArrow), modifiers: UInt32(optionKey))
+        registerHotkey(.snapUp, keyCode: UInt32(kVK_UpArrow), modifiers: UInt32(optionKey))
+        registerHotkey(.snapDown, keyCode: UInt32(kVK_DownArrow), modifiers: UInt32(optionKey))
+        registerHotkey(.workstationHUD, keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey | optionKey))
+    }
+
+    private func registerHotkey(_ id: HotkeyID, keyCode: UInt32, modifiers: UInt32) {
+        var hotKeyRef: EventHotKeyRef?
+        let hotkeyID = EventHotKeyID(signature: FourCharCode("PWST".fourCharCodeValue), id: id.rawValue)
+
+        let status = RegisterEventHotKey(keyCode, modifiers, hotkeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+
+        if status == noErr {
+            hotkeys.append(hotKeyRef)
+        } else {
+            print("Failed to register hotkey \(id): \(status)")
+        }
+    }
+
+    private func handleHotkey(id: HotkeyID?) {
+        guard let id = id else { return }
+
+        switch id {
+        case .savePermanent:
+            WindowManager.shared.saveWorkstation(temporary: false)
+        case .saveTemporary:
+            WindowManager.shared.saveWorkstation(temporary: true)
+        case .snapLeft:
+            WindowManager.shared.snapActiveWindow(.left)
+        case .snapRight:
+            WindowManager.shared.snapActiveWindow(.right)
+        case .snapUp:
+            WindowManager.shared.snapActiveWindow(.top)
+        case .snapDown:
+            WindowManager.shared.snapActiveWindow(.bottom)
+        case .workstationHUD:
+            WorkstationHUD.shared.toggle()
+        }
+    }
+
+    deinit {
+        if let eventHandler = eventHandler {
+            RemoveEventHandler(eventHandler)
+        }
+        hotkeys.forEach { hotkey in
+            if let hotkey = hotkey {
+                UnregisterEventHotKey(hotkey)
+            }
+        }
+    }
+}
+
 // MARK: - App Delegate
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
-    var eventMonitor: Any?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusBar()
-        setupGlobalHotkeys()
         requestAccessibilityPermissions()
+
+        // Register global hotkeys after a brief delay to ensure app is fully loaded
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            GlobalHotkeyManager.shared.registerHotkeys()
+        }
     }
     
     private func setupStatusBar() {
@@ -83,20 +329,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.menu = menu
     }
     
-    private func setupGlobalHotkeys() {
-        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
-            if event.modifierFlags.contains([.command, .option]) {
-                switch event.charactersIgnoringModifiers {
-                case "s":
-                    WindowManager.shared.saveWorkstation(temporary: false)
-                case "t":
-                    WindowManager.shared.saveWorkstation(temporary: true)
-                default:
-                    break
-                }
-            }
-        }
-    }
     
     private func requestAccessibilityPermissions() {
         let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
@@ -122,9 +354,13 @@ struct WindowInfo: Codable, Identifiable {
     let windowTitle: String
     var frame: CGRect
     let windowNumber: Int
-    
+    let processID: pid_t
+    let isMinimized: Bool
+    let isFullscreen: Bool
+    let spaceID: Int?
+
     enum CodingKeys: String, CodingKey {
-        case appName, appBundleID, windowTitle, frame, windowNumber
+        case appName, appBundleID, windowTitle, frame, windowNumber, processID, isMinimized, isFullscreen, spaceID
     }
 }
 
@@ -132,12 +368,14 @@ struct Workstation: Codable, Identifiable {
     let id = UUID()
     var name: String
     var windows: [WindowInfo]
+    var runningApps: [String] // Bundle IDs
     var isTemporary: Bool
     var createdAt: Date
     var lastUsed: Date
-    
+    var thumbnail: Data? // Preview image
+
     enum CodingKeys: String, CodingKey {
-        case name, windows, isTemporary, createdAt, lastUsed
+        case name, windows, runningApps, isTemporary, createdAt, lastUsed, thumbnail
     }
 }
 
@@ -220,16 +458,54 @@ class WindowManager: ObservableObject {
     func splitWindow(_ position: SplitPosition) {
         guard let frontWindow = NSWorkspace.shared.frontmostApplication,
               let screen = NSScreen.main else { return }
-        
+
         let targetFrame = position.frame(for: screen)
-        
+
         // Use Accessibility API to resize window
         if let app = NSRunningApplication(processIdentifier: frontWindow.processIdentifier) {
-            moveWindow(app: app, to: targetFrame)
+            moveActiveWindow(app: app, to: targetFrame)
         }
     }
+
+    // MARK: - Window Snapping
+    func snapActiveWindow(_ position: SplitPosition) {
+        guard let frontApp = NSWorkspace.shared.frontmostApplication,
+              let screen = getScreenForActiveWindow() else { return }
+
+        let targetFrame = position.frame(for: screen)
+        moveActiveWindow(app: frontApp, to: targetFrame)
+    }
+
+    private func getScreenForActiveWindow() -> NSScreen? {
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+            return NSScreen.main
+        }
+
+        let appElement = AXUIElementCreateApplication(frontApp.processIdentifier)
+        var windowElement: AnyObject?
+        AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowElement)
+
+        if let window = windowElement {
+            var positionValue: AnyObject?
+            AXUIElementCopyAttributeValue(window as! AXUIElement, kAXPositionAttribute as CFString, &positionValue)
+
+            if let position = positionValue {
+                var point = CGPoint.zero
+                AXValueGetValue(position as! AXValue, .cgPoint, &point)
+
+                // Find screen containing this point
+                for screen in NSScreen.screens {
+                    if screen.frame.contains(point) {
+                        return screen
+                    }
+                }
+            }
+        }
+
+        return NSScreen.main
+    }
     
-    private func moveWindow(app: NSRunningApplication, to frame: CGRect) {
+    private func moveActiveWindow(app: NSRunningApplication, to frame: CGRect) {
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
         
         var windowElement: AnyObject?
@@ -248,46 +524,188 @@ class WindowManager: ObservableObject {
     
     // MARK: - Workstation Management
     func saveWorkstation(temporary: Bool) {
-        refreshActiveWindows()
-        
-        let workstation = Workstation(
-            name: temporary ? "Temp \(Date().formatted())" : "Workstation \(workstations.count + 1)",
-            windows: activeWindows,
-            isTemporary: temporary,
-            createdAt: Date(),
-            lastUsed: Date()
-        )
-        
-        workstations.append(workstation)
-        saveWorkstations()
-        
-        if temporary {
-            setupTemporaryWorkstationMonitoring(workstation)
+        captureCompleteWorkstation { [weak self] workstation in
+            guard let self = self, var workstation = workstation else { return }
+
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateStyle = .medium
+            dateFormatter.timeStyle = .short
+
+            workstation.name = temporary ? "Temp \(dateFormatter.string(from: Date()))" : "Workstation \(self.workstations.count + 1)"
+            workstation.isTemporary = temporary
+
+            DispatchQueue.main.async {
+                self.workstations.append(workstation)
+                self.saveWorkstations()
+
+                if temporary {
+                    self.setupTemporaryWorkstationMonitoring(workstation)
+                }
+
+                // Show confirmation
+                let message = temporary ? "Temporary workstation saved" : "Workstation saved"
+                WorkstationHUD.shared.showMessage(message)
+            }
         }
+    }
+
+    private func captureCompleteWorkstation(completion: @escaping (Workstation?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            var allWindows: [WindowInfo] = []
+            var runningApps: [String] = []
+
+            // Get all running applications
+            let workspace = NSWorkspace.shared
+            let runningApplications = workspace.runningApplications.filter { app in
+                app.activationPolicy == .regular && app.bundleIdentifier != nil
+            }
+
+            for app in runningApplications {
+                guard let bundleID = app.bundleIdentifier else { continue }
+                runningApps.append(bundleID)
+
+                // Get windows for this app
+                let appElement = AXUIElementCreateApplication(app.processIdentifier)
+                var windowList: AnyObject?
+                AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowList)
+
+                if let windows = windowList as? [AnyObject] {
+                    for (index, window) in windows.enumerated() {
+                        if let windowInfo = self.createWindowInfo(from: window as! AXUIElement, app: app, index: index) {
+                            allWindows.append(windowInfo)
+                        }
+                    }
+                }
+            }
+
+            let workstation = Workstation(
+                name: "",
+                windows: allWindows,
+                runningApps: runningApps,
+                isTemporary: false,
+                createdAt: Date(),
+                lastUsed: Date(),
+                thumbnail: nil
+            )
+
+            completion(workstation)
+        }
+    }
+
+    private func createWindowInfo(from window: AXUIElement, app: NSRunningApplication, index: Int) -> WindowInfo? {
+        var titleValue: AnyObject?
+        var positionValue: AnyObject?
+        var sizeValue: AnyObject?
+        var minimizedValue: AnyObject?
+        // var fullscreenValue: AnyObject?
+
+        AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleValue)
+        AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionValue)
+        AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue)
+        AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimizedValue)
+        // Note: kAXFullScreenAttribute may not be available on all systems
+        // AXUIElementCopyAttributeValue(window, kAXFullScreenAttribute as CFString, &fullscreenValue)
+
+        guard let title = titleValue as? String,
+              let positionVal = positionValue,
+              let sizeVal = sizeValue,
+              let appName = app.localizedName,
+              let bundleID = app.bundleIdentifier else {
+            return nil
+        }
+
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        AXValueGetValue(positionVal as! AXValue, .cgPoint, &position)
+        AXValueGetValue(sizeVal as! AXValue, .cgSize, &size)
+
+        let isMinimized = (minimizedValue as? Bool) ?? false
+        let isFullscreen = false // (fullscreenValue as? Bool) ?? false
+
+        // Skip windows that are too small or have no title
+        if title.isEmpty || size.width < 50 || size.height < 50 {
+            return nil
+        }
+
+        return WindowInfo(
+            appName: appName,
+            appBundleID: bundleID,
+            windowTitle: title,
+            frame: CGRect(origin: position, size: size),
+            windowNumber: index,
+            processID: app.processIdentifier,
+            isMinimized: isMinimized,
+            isFullscreen: isFullscreen,
+            spaceID: getCurrentSpaceID()
+        )
+    }
+
+    private func getCurrentSpaceID() -> Int? {
+        // This would require private APIs or additional frameworks
+        // For now, return nil - can be enhanced later
+        return nil
     }
     
     func loadWorkstation(_ workstation: Workstation) {
         currentWorkstation = workstation
-        
-        for windowInfo in workstation.windows {
-            // Launch app if not running
-            if !isAppRunning(bundleID: windowInfo.appBundleID) {
-                if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: windowInfo.appBundleID) {
-                    let configuration = NSWorkspace.OpenConfiguration()
-                    NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { _, _ in }
-                }
-            }
-            
-            // Restore window position
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                self.restoreWindowPosition(windowInfo)
-            }
-        }
-        
+
         // Update last used
         if let index = workstations.firstIndex(where: { $0.id == workstation.id }) {
             workstations[index].lastUsed = Date()
             saveWorkstations()
+        }
+
+        // Show loading HUD
+        WorkstationHUD.shared.showLoading("Restoring \(workstation.name)...")
+
+        // Launch apps that aren't running
+        let missingApps = workstation.runningApps.filter { !isAppRunning(bundleID: $0) }
+
+        if !missingApps.isEmpty {
+            launchMissingApps(missingApps) { [weak self] in
+                // Wait for apps to fully launch before positioning windows
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    self?.restoreWindowPositions(workstation.windows)
+                }
+            }
+        } else {
+            // All apps are running, restore immediately
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.restoreWindowPositions(workstation.windows)
+            }
+        }
+    }
+
+    private func launchMissingApps(_ bundleIDs: [String], completion: @escaping () -> Void) {
+        let group = DispatchGroup()
+
+        for bundleID in bundleIDs {
+            group.enter()
+            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+                let configuration = NSWorkspace.OpenConfiguration()
+                NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { _, _ in
+                    group.leave()
+                }
+            } else {
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) {
+            completion()
+        }
+    }
+
+    private func restoreWindowPositions(_ windows: [WindowInfo]) {
+        for windowInfo in windows {
+            if isAppRunning(bundleID: windowInfo.appBundleID) {
+                restoreWindowPosition(windowInfo)
+            }
+        }
+
+        // Hide loading HUD
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            WorkstationHUD.shared.hide()
         }
     }
     
@@ -310,7 +728,11 @@ class WindowManager: ObservableObject {
                 appBundleID: app.bundleIdentifier ?? "",
                 windowTitle: "",
                 frame: frame,
-                windowNumber: 0
+                windowNumber: 0,
+                processID: app.processIdentifier,
+                isMinimized: false,
+                isFullscreen: false,
+                spaceID: nil
             )
             
             windows.append(windowInfo)
@@ -319,9 +741,11 @@ class WindowManager: ObservableObject {
         let workstation = Workstation(
             name: "Custom Workstation",
             windows: windows,
+            runningApps: apps.compactMap { $0.bundleIdentifier },
             isTemporary: temporary,
             createdAt: Date(),
-            lastUsed: Date()
+            lastUsed: Date(),
+            thumbnail: nil
         )
         
         workstations.append(workstation)
@@ -352,7 +776,11 @@ class WindowManager: ObservableObject {
                 appBundleID: "",
                 windowTitle: window[kCGWindowName as String] as? String ?? "",
                 frame: frame,
-                windowNumber: windowNumber
+                windowNumber: windowNumber,
+                processID: window[kCGWindowOwnerPID as String] as? pid_t ?? 0,
+                isMinimized: false,
+                isFullscreen: false,
+                spaceID: nil
             )
             
             activeWindows.append(windowInfo)
@@ -1002,9 +1430,125 @@ class AppSwitcherWindow: NSWindow {
     }
 }
 
+// MARK: - Workstation HUD View
+struct WorkstationHUDView: View {
+    @EnvironmentObject var hud: WorkstationHUD
+
+    var body: some View {
+        VStack {
+            if hud.isLoading {
+                VStack(spacing: 16) {
+                    ProgressView()
+                        .scaleEffect(1.5)
+                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+
+                    Text(hud.message)
+                        .font(.headline)
+                        .foregroundColor(.white)
+                }
+                .padding(40)
+            } else if !hud.message.isEmpty {
+                VStack(spacing: 16) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 40))
+                        .foregroundColor(.green)
+
+                    Text(hud.message)
+                        .font(.headline)
+                        .foregroundColor(.white)
+                }
+                .padding(40)
+            } else {
+                VStack(spacing: 12) {
+                    Text("Select Workstation")
+                        .font(.title2)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.white)
+                        .padding(.bottom, 8)
+
+                    ForEach(Array(hud.workstations.enumerated()), id: \.element.id) { index, workstation in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(workstation.name)
+                                    .font(.headline)
+                                    .foregroundColor(.white)
+
+                                Text("\(workstation.windows.count) windows • \(workstation.runningApps.count) apps")
+                                    .font(.caption)
+                                    .foregroundColor(.white.opacity(0.7))
+
+                                if workstation.isTemporary {
+                                    Text("Temporary")
+                                        .font(.caption2)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.orange.opacity(0.3))
+                                        .cornerRadius(4)
+                                        .foregroundColor(.orange)
+                                }
+                            }
+
+                            Spacer()
+
+                            Text(workstation.lastUsed.formatted(date: .omitted, time: .shortened))
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.5))
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                        .background(
+                            index == hud.selectedIndex ?
+                            Color.blue.opacity(0.6) :
+                            Color.clear
+                        )
+                        .cornerRadius(8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(
+                                    index == hud.selectedIndex ?
+                                    Color.blue :
+                                    Color.clear,
+                                    lineWidth: 2
+                                )
+                        )
+                    }
+
+                    if !hud.workstations.isEmpty {
+                        Text("↑↓ Navigate • ⏎ Select • ⎋ Cancel")
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.6))
+                            .padding(.top, 8)
+                    }
+                }
+                .padding(24)
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color.black.opacity(0.85))
+                .shadow(color: .black.opacity(0.3), radius: 20, x: 0, y: 10)
+        )
+        .frame(maxWidth: 400)
+    }
+}
+
 // MARK: - Extensions
 extension NSScreen {
     var displayID: CGDirectDisplayID {
         return deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
+    }
+}
+
+extension String {
+    var fourCharCodeValue: FourCharCode {
+        var result: FourCharCode = 0
+        if let data = self.data(using: .macOSRoman) {
+            data.withUnsafeBytes { bytes in
+                for i in 0..<min(4, bytes.count) {
+                    result = (result << 8) + FourCharCode(bytes[i])
+                }
+            }
+        }
+        return result
     }
 }

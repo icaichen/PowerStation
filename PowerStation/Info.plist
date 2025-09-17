@@ -37,8 +37,12 @@
     <key>NSSupportsSuddenTermination</key>
     <false/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Window Manager needs to control other applications to manage their windows.</string>
+    <string>PowerStation needs to control other applications to manage their windows and workstations.</string>
     <key>NSSystemAdministrationUsageDescription</key>
-    <string>Window Manager needs accessibility permissions to manage window positions.</string>
+    <string>PowerStation needs accessibility permissions to manage window positions and capture window information.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>PowerStation needs screen recording permissions to capture workspace thumbnails and monitor window changes.</string>
+    <key>NSWorkspaceUsageDescription</key>
+    <string>PowerStation needs workspace access to monitor running applications and manage workstation layouts.</string>
 </dict>
 </plist>

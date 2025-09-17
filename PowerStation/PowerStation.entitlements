@@ -13,5 +13,14 @@
     </array>
     <key>com.apple.security.automation.apple-events</key>
     <true/>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>PowerStation.shared</string>
+    </array>
+    <key>com.apple.security.temporary-exception.shared-preference.read-write</key>
+    <array>
+        <string>com.apple.spaces</string>
+        <string>com.apple.dock</string>
+    </array>
 </dict>
 </plist>
